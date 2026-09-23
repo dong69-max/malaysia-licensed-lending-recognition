@@ -1,19 +1,18 @@
 /**
  * 浏览器端 PDF 读取：全程在本机完成，不上传任何文件。
- * - 文字版 PDF：直接读取页面内嵌文字（快而准）
- * - 扫描版 PDF（图片页）：渲染成图片，交给 OCR
+ * - 文字版 PDF：直接读取页面内嵌文字（快而准），无需渲染
+ * - 扫描版 PDF（图片页）：尝试把页面渲染成图片交给 OCR；
+ *   部分浏览器不支持时优雅降级，由界面提示改用截图
  *
  * PDF 引擎（主库 + worker）成对从官方 CDN 加载同一版本，
  * 只下载代码，文档内容不会离开浏览器。
  */
 
-/** PDF 识别支持（含文字版直读与扫描版 OCR） */
-
 export interface PdfPageResult {
   pageNumber: number;
   /** 文字版 PDF 直接读出的文字；扫描版为空字符串 */
   text: string;
-  /** 页面渲染成的 PNG dataURL（用于 OCR 与预览） */
+  /** 页面渲染成的 PNG dataURL（用于 OCR 与预览）；无法渲染时为空字符串 */
   image: string;
 }
 
@@ -34,18 +33,10 @@ const CDN_BASES = [
   `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}`,
 ];
 
-let cached: Promise<PdfjsModule> | null = null;
+/** 单页渲染超时（毫秒）：卡住就放弃渲染，只保留文字 */
+const RENDER_TIMEOUT_MS = 15000;
 
-/**
- * 用原生动态导入加载模块，绕开打包器对 import 的静态改写。
- */
-const nativeImport = (() => {
-  try {
-    return new Function('u', 'return import(u)') as (u: string) => Promise<PdfjsModule>;
-  } catch {
-    return (u: string) => import(/* @vite-ignore */ u);
-  }
-})();
+let cached: Promise<{ mod: PdfjsModule; base: string }> | null = null;
 
 /**
  * 生成一个同源的 worker 入口（内容只有一句 import），
@@ -56,15 +47,16 @@ function makeWorkerEntry(workerUrl: string): string {
   return URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
 }
 
-async function loadFromCdn(base: string): Promise<PdfjsModule> {
+async function loadFromCdn(base: string): Promise<{ mod: PdfjsModule; base: string }> {
+  // 运行时拼接的地址 + @vite-ignore，让浏览器直接从 CDN 加载
   const mainUrl = `${base}/build/pdf.min.mjs`;
-  const mod = await nativeImport(mainUrl);
+  const mod = (await import(/* @vite-ignore */ mainUrl)) as PdfjsModule;
   if (!mod?.getDocument) throw new Error('CDN_PDFJS_INVALID');
   mod.GlobalWorkerOptions.workerSrc = makeWorkerEntry(`${base}/build/pdf.worker.min.mjs`);
-  return mod;
+  return { mod, base };
 }
 
-function loadPdfjs(): Promise<PdfjsModule> {
+function loadPdfjs(): Promise<{ mod: PdfjsModule; base: string }> {
   if (cached) return cached;
   cached = (async () => {
     for (const base of CDN_BASES) {
@@ -79,21 +71,43 @@ function loadPdfjs(): Promise<PdfjsModule> {
     local.GlobalWorkerOptions.workerSrc = makeWorkerEntry(
       `${CDN_BASES[0]}/build/pdf.worker.min.mjs`,
     );
-    return local;
+    return { mod: local, base: CDN_BASES[0] };
   })();
   return cached;
 }
 
-// 临时调试导出（测试后移除）
-export const __debug = { nativeImport, loadPdfjs, makeWorkerEntry };
+/** 渲染一页；失败或超时返回空字符串，不让整个流程卡死 */
+async function renderPageSafe(page: import('pdfjs-dist').PDFPageProxy, scale: number): Promise<string> {
+  try {
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.floor(viewport.width);
+    canvas.height = Math.floor(viewport.height);
+    await Promise.race([
+      page.render({ canvas, viewport }).promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('RENDER_TIMEOUT')), RENDER_TIMEOUT_MS)),
+    ]);
+    return canvas.toDataURL('image/png');
+  } catch {
+    return '';
+  }
+}
 
 export async function readPdf(file: File, opts: ReadPdfOptions = {}): Promise<PdfPageResult[]> {
   const { maxPages = 8, scale = 2, onPage } = opts;
 
-  const pdfjs = await loadPdfjs();
+  const { mod: pdfjs, base } = await loadPdfjs();
 
   const raw = await file.arrayBuffer();
-  const doc = await pdfjs.getDocument({ data: raw }).promise;
+  const doc = await pdfjs
+    .getDocument({
+      data: raw,
+      // 标准字体与 CMap 也从同一 CDN 加载
+      cMapUrl: `${base}/cmaps/`,
+      cMapPacked: true,
+      standardFontDataUrl: `${base}/standard_fonts/`,
+    })
+    .promise;
   const totalPages = Math.min(doc.numPages, maxPages);
   const results: PdfPageResult[] = [];
 
@@ -101,7 +115,7 @@ export async function readPdf(file: File, opts: ReadPdfOptions = {}): Promise<Pd
     onPage?.(i, totalPages);
     const page = await doc.getPage(i);
 
-    // 1) 尝试直接读取页面文字（文字版 PDF）
+    // 1) 读取页面内嵌文字（文字版 PDF 到此即完成）
     const content = await page.getTextContent();
     const text = content.items
       .map((item) => ('str' in item ? item.str : ''))
@@ -109,16 +123,13 @@ export async function readPdf(file: File, opts: ReadPdfOptions = {}): Promise<Pd
       .replace(/\s+/g, ' ')
       .trim();
 
-    // 2) 渲染成图片（供扫描版 OCR 与预览使用）
-    const viewport = page.getViewport({ scale });
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.floor(viewport.width);
-    canvas.height = Math.floor(viewport.height);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) throw new Error('PDF_RENDER_NO_CONTEXT');
-    await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+    // 2) 文字太少（扫描版）才渲染成图片供 OCR 使用
+    let image = '';
+    if (needsOcr(text)) {
+      image = await renderPageSafe(page, scale);
+    }
 
-    results.push({ pageNumber: i, text, image: canvas.toDataURL('image/png') });
+    results.push({ pageNumber: i, text, image });
     page.cleanup();
   }
 

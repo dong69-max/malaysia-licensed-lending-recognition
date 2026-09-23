@@ -50,23 +50,37 @@ export default function Scan() {
           maxPages: 8,
           onPage: (n, total) => setStatusText(`正在读取 PDF 第 ${n}/${total} 页…`),
         });
-        if (pages.length > 0) setPreview(pages[0].image);
+        const firstImage = pages.find((p) => p.image)?.image || '';
+        setPreview(firstImage);
 
         const collected: { text: string; ocrText?: string }[] = [];
+        let scannedWithoutImage = false;
         for (let i = 0; i < pages.length; i++) {
           const page = pages[i];
           if (needsOcr(page.text)) {
-            setStatusText(`第 ${page.pageNumber} 页是扫描图片，正在识别文字…`);
-            const ocr = await ocrImage(page.image, (p) => {
-              setProgress(Math.round(((i + p) / pages.length) * 100));
-            });
-            collected.push({ text: page.text, ocrText: ocr });
+            if (page.image) {
+              setStatusText(`第 ${page.pageNumber} 页是扫描图片，正在识别文字…`);
+              const ocr = await ocrImage(page.image, (p) => {
+                setProgress(Math.round(((i + p) / pages.length) * 100));
+              });
+              collected.push({ text: page.text, ocrText: ocr });
+            } else {
+              scannedWithoutImage = true;
+              collected.push({ text: page.text });
+            }
           } else {
             collected.push({ text: page.text });
             setProgress(Math.round(((i + 1) / pages.length) * 100));
           }
         }
         text = mergePageTexts(collected);
+        if (scannedWithoutImage && !text.trim()) {
+          setError(
+            '这个 PDF 是扫描/图片版，当前浏览器无法把页面转成图片识别。请改拍一张该笔交易的截图，或直接手动输入。',
+          );
+          setStage('review');
+          return;
+        }
       } else {
         setStatusText('正在识别文字…');
         text = await ocrImage(file, (p) => setProgress(Math.round(p * 100)));
